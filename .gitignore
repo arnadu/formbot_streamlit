@@ -1,0 +1,16 @@
+# Virtual environment
+.venv/
+
+# User data
+app_data/
+dummy_uploads/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Old versioned app files
+app v*.py
