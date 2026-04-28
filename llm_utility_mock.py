@@ -9,6 +9,20 @@ from typing import Iterable
 import pandas as pd
 
 
+def prepare_file(pdf_path: str | Path) -> Path | None:
+    """Mock OCR step: create a Markdown file for a single PDF. Returns the created file."""
+    pdf_path = Path(pdf_path)
+    if pdf_path.suffix.lower() != ".pdf":
+        return None
+    md_file = pdf_path.with_suffix(".md")
+    md_file.write_text(
+        f"# OCR output for {pdf_path.name}\n\n"
+        "This is mocked Markdown content that stands in for OCR output.\n",
+        encoding="utf-8",
+    )
+    return md_file
+
+
 def prepare(folder_names: Iterable[str | Path]) -> list[Path]:
     """Mock OCR step: create one Markdown file for each PDF found in each folder."""
     created_files: list[Path] = []
@@ -30,13 +44,9 @@ def prepare(folder_names: Iterable[str | Path]) -> list[Path]:
             continue
 
         for pdf_file in pdf_files:
-            md_file = pdf_file.with_suffix(".md")
-            md_file.write_text(
-                f"# OCR output for {pdf_file.name}\n\n"
-                "This is mocked Markdown content that stands in for OCR output.\n",
-                encoding="utf-8",
-            )
-            created_files.append(md_file)
+            md_file = prepare_file(pdf_file)
+            if md_file:
+                created_files.append(md_file)
 
     return created_files
 

@@ -10,7 +10,7 @@ from uuid import uuid4
 import pandas as pd
 import streamlit as st
 
-from llm_utility_mock import prepare, process
+from llm_utility_mock import prepare_file, process
 
 
 APP_DATA = Path("app_data")
@@ -146,26 +146,26 @@ def render_library_management_sidebar() -> None:
         )
         st.session_state[active_folder_key] = selected_folder.name
 
-        files_upload = st.file_uploader(
+        folder_upload_key = f"sidebar_files_{library.name}_{selected_folder.name}"
+        st.file_uploader(
             f"PDF / Markdown → {selected_folder.name}",
             accept_multiple_files=True,
             type=["pdf", "md"],
-            key=f"sidebar_files_{library.name}_{selected_folder.name}",
+            key=folder_upload_key,
+            on_change=_on_upload,
+            args=(folder_upload_key, selected_folder, False),
         )
-        maybe_auto_save_folder_upload(files_upload, selected_folder, library)
 
-    dir_upload = st.file_uploader(
+    dir_upload_key = f"sidebar_dir_{library.name}"
+    st.file_uploader(
         "Upload folder tree",
         accept_multiple_files="directory",
-        key=f"sidebar_dir_{library.name}",
+        key=dir_upload_key,
+        on_change=_on_upload,
+        args=(dir_upload_key, library, True),
     )
-    maybe_auto_save_library_upload(dir_upload, library, f"sidebar_dir::{library.name}")
 
-    if folders:
-        if st.button("Run prepare()", key=f"sidebar_prepare_{library.name}"):
-            created = prepare(list_library_folders(library))
-            flash(f"prepare() created {len(created)} file(s).")
-            st.rerun()
+    _run_pending_prepare()
 
 
 @st.fragment
@@ -218,18 +218,8 @@ def render_main_page() -> None:
 
     state = load_library_state(library)
     folders = list_library_folders(library)
-    summary = summarize_library(library, state)
 
-    col_title, col_m1, col_m2, col_m3 = st.columns([4, 1, 1, 1])
-    with col_title:
-        st.header(library.name)
-    with col_m1:
-        st.metric("Folders", f"{summary['included_folder_count']}/{summary['folder_count']}")
-    with col_m2:
-        st.metric("Files included", f"{summary['included_file_count']}/{summary['file_count']}")
-    with col_m3:
-        st.metric("Excluded", summary["file_count"] - summary["included_file_count"])
-
+    st.header(library.name)
     st.divider()
 
     tree_col, run_col = st.columns([11, 9])
@@ -238,7 +228,7 @@ def render_main_page() -> None:
         render_file_tree(library, folders, state)
 
     with run_col:
-        render_run_panel(library, question_sets, state, summary)
+        render_run_panel(library, question_sets, state)
 
     st.divider()
     render_results_panel()
@@ -255,11 +245,10 @@ def render_file_tree(library: Path, folders: list[Path], state: dict) -> None:
 
     for folder in folders:
         files = list_scope_files(folder)
-        included_count = sum(1 for f in files if is_file_included(library, f, state))
         folder_included = is_scope_included(library, folder, state)
 
         new_folder_included = st.checkbox(
-            f"📁 **{folder.name}** — {included_count} / {len(files)} included",
+            f"📁 **{folder.name}**",
             value=folder_included,
             key=f"tree_folder_{library.name}_{folder.name}",
         )
@@ -287,7 +276,6 @@ def render_run_panel(
     library: Path,
     question_sets: list[Path],
     state: dict,
-    summary: dict,
 ) -> None:
     st.subheader("Run")
 
@@ -307,7 +295,11 @@ def render_run_panel(
         with st.expander("Preview questions"):
             st.dataframe(pd.read_excel(questions_xlsx), width="stretch")
 
-    can_run = summary["included_file_count"] > 0
+    can_run = any(
+        is_file_included(library, f, state)
+        for folder in list_library_folders(library)
+        for f in list_scope_files(folder)
+    )
     if not can_run:
         st.warning("No files included. Check at least one file in the tree.")
 
@@ -326,8 +318,6 @@ def render_run_panel(
             "run_id": run_id,
             "library": library.name,
             "question_set": selected_qs.name,
-            "included_folder_count": summary["included_folder_count"],
-            "included_file_count": summary["included_file_count"],
             "jsonl_path": str(jsonl_path),
             "xlsx_path": str(xlsx_path),
             "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -401,42 +391,32 @@ def materialize_included_inputs(library: Path, state: dict, destination_root: Pa
 # Upload helpers
 # ---------------------------------------------------------------------------
 
-def maybe_auto_save_library_upload(
-    uploaded_files: list | None,
-    destination: Path,
-    upload_key: str,
-) -> None:
-    if not uploaded_files:
+def _on_upload(upload_key: str, destination: Path, strip_common_root: bool) -> None:
+    files = st.session_state.get(upload_key)
+    if files:
+        saved = save_uploaded_files(files, destination, strip_common_root=strip_common_root)
+        flash(f"Uploaded {len(files)} file(s) into `{destination.name}`.")
+        # on_change callbacks run before the script rerenders, so st.status/st.write
+        # are not available here. We store the saved paths and defer prepare() to
+        # _run_pending_prepare(), which is called from the normal render pass.
+        pending: set[Path] = st.session_state.get("pending_prepare", set())
+        pending |= saved
+        st.session_state["pending_prepare"] = pending
+
+
+def _run_pending_prepare() -> None:
+    # Having prepare_file() operate on a single file lets us call it once per
+    # uploaded file and log each one individually — no callback injection needed.
+    pending: set[Path] | None = st.session_state.pop("pending_prepare", None)
+    if not pending:
         return
-
-    signature = upload_signature(uploaded_files)
-    processed_key = f"processed_upload::{upload_key}"
-    if st.session_state.get(processed_key) == signature:
-        return
-
-    save_uploaded_files(uploaded_files, destination, strip_common_root=True)
-    st.session_state[processed_key] = signature
-    flash(f"Uploaded {len(uploaded_files)} file(s) into `{destination.name}`.")
-    st.rerun()
-
-
-def maybe_auto_save_folder_upload(
-    uploaded_files: list | None,
-    folder: Path,
-    library: Path,
-) -> None:
-    if not uploaded_files:
-        return
-
-    signature = upload_signature(uploaded_files)
-    processed_key = f"processed_upload::folder::{library.name}::{scope_key(folder, library)}"
-    if st.session_state.get(processed_key) == signature:
-        return
-
-    save_uploaded_files(uploaded_files, folder)
-    st.session_state[processed_key] = signature
-    flash(f"Uploaded {len(uploaded_files)} file(s) into `{folder.name}`.")
-    st.rerun()
+    with st.status("Running prepare()…", expanded=True) as status:
+        count = 0
+        for path in sorted(pending):
+            st.write(f"↳ {path.name}")
+            prepare_file(path)
+            count += 1
+        status.update(label=f"prepare() complete — {count} file(s) created.", state="complete")
 
 
 def save_question_set(question_file) -> str:
@@ -447,26 +427,29 @@ def save_question_set(question_file) -> str:
     return question_path.name
 
 
-def upload_signature(uploaded_files: list) -> tuple[tuple[str, int], ...]:
-    return tuple((f.name, len(f.getbuffer())) for f in uploaded_files)
-
-
 def save_uploaded_files(
     uploaded_files: list,
     destination: Path,
     strip_common_root: bool = False,
-) -> None:
+) -> set[Path]:
     destination.mkdir(parents=True, exist_ok=True)
+    # For directory uploads the browser prefixes every filename with the dragged
+    # folder name (e.g. "acme-docs/contracts/q1.pdf"). Strip that redundant top
+    # level so files land directly under `destination` rather than one level deeper.
     common_root = common_upload_root(uploaded_files) if strip_common_root else None
 
+    saved: set[Path] = set()
     for uploaded_file in uploaded_files:
         relative_name = normalize_uploaded_name(uploaded_file.name, common_root=common_root)
         target = destination / relative_name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(uploaded_file.getbuffer())
+        saved.add(target)
+    return saved
 
 
 def normalize_uploaded_name(name: str, common_root: str | None = None) -> Path:
+    # Browser path separators can be / or \ depending on OS; slugify each component.
     parts = [slugify(part) for part in re.split(r"[\\/]+", name) if part not in {"", ".", ".."}]
     if common_root and len(parts) > 1 and parts[0] == common_root:
         parts = parts[1:]
@@ -476,10 +459,27 @@ def normalize_uploaded_name(name: str, common_root: str | None = None) -> Path:
 
 
 def common_upload_root(uploaded_files: list) -> str | None:
+    # Determines whether a single redundant top-level folder name should be stripped
+    # from all uploaded paths before saving. Three cases:
+    #
+    #   Flat folder — user drags "acme/" containing files directly:
+    #     browser sends: acme/file1.pdf, acme/file2.pdf  (2 parts)
+    #     → return None (no stripping) → saved as library/acme/file1.pdf ✓
+    #
+    #   Nested folder — user drags "acme/" containing sub-folders:
+    #     browser sends: acme/contracts/q1.pdf, acme/reports/r1.pdf  (3 parts)
+    #     → return "acme" → saved as library/contracts/q1.pdf ✓
+    #
+    #   Multiple folders — user drags "A/" and "B/" together:
+    #     browser sends: A/file1.pdf, B/file2.pdf  (different first parts)
+    #     → return None (no stripping) → saved as library/A/file1.pdf, library/B/file2.pdf ✓
+    #
+    # The len < 3 guard handles the flat-folder case: files sitting directly inside
+    # the dragged root produce only 2 parts, so we preserve the folder name.
     first_parts: list[str] = []
     for uploaded_file in uploaded_files:
         parts = [slugify(part) for part in re.split(r"[\\/]+", uploaded_file.name) if part not in {"", ".", ".."}]
-        if len(parts) < 2:
+        if len(parts) < 3:
             return None
         first_parts.append(parts[0])
 
@@ -551,28 +551,6 @@ def set_file_included(library: Path, path: Path, state: dict, included: bool) ->
 # ---------------------------------------------------------------------------
 # Library / directory helpers
 # ---------------------------------------------------------------------------
-
-def summarize_library(library: Path, state: dict) -> dict[str, int]:
-    folders = list_library_folders(library)
-    file_count = 0
-    included_file_count = 0
-    included_folder_count = 0
-
-    for folder in folders:
-        files = list_scope_files(folder)
-        file_count += len(files)
-        included_files = [f for f in files if is_file_included(library, f, state)]
-        included_file_count += len(included_files)
-        if included_files:
-            included_folder_count += 1
-
-    return {
-        "folder_count": len(folders),
-        "file_count": file_count,
-        "included_file_count": included_file_count,
-        "included_folder_count": included_folder_count,
-    }
-
 
 def list_library_folders(library: Path) -> list[Path]:
     return sorted(
