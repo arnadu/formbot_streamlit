@@ -50,9 +50,9 @@ def render_sidebar() -> None:
     with st.sidebar:
         st.title("FormBot")
         st.divider()
-        render_library_management_sidebar()
-        st.divider()
         render_question_upload_sidebar()
+        st.divider()
+        render_library_management_sidebar()
 
 
 def render_library_management_sidebar() -> None:
@@ -105,30 +105,30 @@ def render_library_management_sidebar() -> None:
     st.divider()
     st.subheader("Upload files")
 
-    # New folder row
-    col_name, col_btn = st.columns([3, 1])
-    with col_name:
+    folders = list_library_folders(library)
+
+    with st.expander("+ New folder", expanded=not folders):
         new_folder = st.text_input(
-            "New folder name",
+            "Folder name",
             placeholder="folder-name",
             key=f"sidebar_new_folder_{library.name}",
             label_visibility="collapsed",
         )
-    with col_btn:
         if st.button(
-            "+ Folder",
-            key=f"sidebar_create_folder_{library.name}",
+            "Create folder",
             disabled=not new_folder.strip(),
+            key=f"sidebar_create_folder_{library.name}",
+            type="primary",
         ):
             slug = slugify(new_folder)
             fp = library / slug
-            if not fp.exists():
+            if fp.exists():
+                st.error(f"Already exists: `{slug}`")
+            else:
                 fp.mkdir(parents=True, exist_ok=True)
                 st.session_state[f"sidebar_active_folder_{library.name}"] = slug
                 flash(f"Created folder `{slug}`.")
                 st.rerun()
-
-    folders = list_library_folders(library)
 
     if folders:
         active_folder_key = f"sidebar_active_folder_{library.name}"
