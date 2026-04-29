@@ -19,8 +19,6 @@ APP_DATA = Path("app_data")
 LIBRARIES_DIR = APP_DATA / "libraries"
 QUESTION_SETS_DIR = APP_DATA / "question_sets"
 RUNS_DIR = APP_DATA / "runs"
-LIBRARY_STATE_FILENAME = ".formbot_state.json"
-LIBRARY_ROOT_KEY = "__root__"
 FLASH_MESSAGE_KEY = "_flash_message"
 LIBRARY_FILE_SUFFIXES = {".pdf", ".md"}
 ACTIVE_LIBRARY_KEY = "active_library"
@@ -229,9 +227,8 @@ def render_main_page() -> None:
         st.session_state[ACTIVE_LIBRARY_KEY] = selected_lib.name
 
     library = selected_lib
-    state = load_library_state(library)
     folders = list_library_folders(library)
-    nodes, checked = build_tree_nodes(library, folders, state)
+    nodes, default_checked = build_tree_nodes(folders)
 
     with qs_col:
         st.caption("Question set")
@@ -247,6 +244,31 @@ def render_main_page() -> None:
             st.caption("Upload a question set in the sidebar.")
             selected_qs = None
 
+    # ── File tree ─────────────────────────────────────────────────────────────
+    # btn_col is intentionally filled AFTER the tree so the Run button can read
+    # result["checked"] directly — columns are containers whose visual position
+    # is fixed at creation; writing to one later does not move it on the page.
+    st.divider()
+
+    if not folders:
+        st.info("No folders yet — create one in the sidebar and upload files.")
+        checked: set[str] = set()
+    else:
+        # Key includes a content hash so the tree re-initialises (and picks up the
+        # correct checked list) whenever files are added or removed.
+        stems_sig = hashlib.md5(
+            ",".join(sorted(c["value"] for n in nodes for c in n.get("children", []))).encode()
+        ).hexdigest()[:8]
+        result = tree_select(
+            nodes,
+            checked=default_checked,
+            check_model="leaf",
+            expand_on_click=True,
+            show_expand_all=True,
+            key=f"file_tree_{library.name}_{stems_sig}",
+        )
+        checked = set(result["checked"])
+
     with btn_col:
         can_run = bool(checked) and selected_qs is not None
         if st.button(
@@ -256,31 +278,7 @@ def render_main_page() -> None:
             key="run_btn",
             use_container_width=True,
         ):
-            _do_run(library, selected_qs, state)
-
-    # ── File tree ─────────────────────────────────────────────────────────────
-    st.divider()
-
-    if not folders:
-        st.info("No folders yet — create one in the sidebar and upload files.")
-    else:
-        # Key includes a content hash so the tree re-initialises (and picks up the
-        # correct checked list) whenever files are added or removed.
-        stems_sig = hashlib.md5(
-            ",".join(sorted(c["value"] for n in nodes for c in n.get("children", []))).encode()
-        ).hexdigest()[:8]
-        result = tree_select(
-            nodes,
-            checked=checked,
-            check_model="leaf",
-            expand_on_click=True,
-            show_expand_all=True,
-            key=f"file_tree_{library.name}_{stems_sig}",
-        )
-        new_checked = set(result["checked"])
-        if new_checked != set(checked):
-            sync_tree_to_state(library, folders, state, new_checked)
-            save_library_state(library, state)
+            _do_run(library, selected_qs, checked)
 
     if selected_qs:
         questions_xlsx = selected_qs / "questions.xlsx"
@@ -292,13 +290,9 @@ def render_main_page() -> None:
     render_results_panel()
 
 
-def build_tree_nodes(library: Path, folders: list[Path], state: dict) -> tuple[list[dict], list[str]]:
-    """Build tree_select node list and the corresponding list of checked leaf values.
-
-    Files are deduplicated by stem so that a PDF and its prepared .md appear
-    as a single entry. The node value is "folder_name/stem" which is stable
-    and unique within a library.
-    """
+def build_tree_nodes(folders: list[Path]) -> tuple[list[dict], list[str]]:
+    # All stems checked by default. The node value "folder/stem" is the key used
+    # to match tree selections back to files in materialize_included_inputs.
     nodes: list[dict] = []
     checked: list[str] = []
     for folder in folders:
@@ -307,23 +301,15 @@ def build_tree_nodes(library: Path, folders: list[Path], state: dict) -> tuple[l
         for stem in stems:
             value = f"{folder.name}/{stem}"
             children.append({"label": stem, "value": value})
-            if any(is_file_included(library, f, state) for f in list_scope_files(folder) if f.stem == stem):
-                checked.append(value)
+            checked.append(value)
         nodes.append({"label": folder.name, "value": f"_folder_{folder.name}", "children": children})
     return nodes, checked
 
 
-def sync_tree_to_state(library: Path, folders: list[Path], state: dict, checked_values: set[str]) -> None:
-    """Write back the tree's checked leaf values to the persisted include/exclude state."""
-    for folder in folders:
-        for f in list_scope_files(folder):
-            set_file_included(library, f, state, f"{folder.name}/{f.stem}" in checked_values)
-
-
-def _do_run(library: Path, selected_qs: Path, state: dict) -> None:
+def _do_run(library: Path, selected_qs: Path, checked: set[str]) -> None:
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
     run_path = RUNS_DIR / run_id
-    targets = materialize_included_inputs(library, state, run_path / "_selected_inputs")
+    targets = materialize_included_inputs(library, checked, run_path / "_selected_inputs")
     questions_xlsx = selected_qs / "questions.xlsx"
     jsonl_path, xlsx_path = process(targets, questions_xlsx, run_path, library.name)
     metadata = {
@@ -379,13 +365,13 @@ def render_results_panel() -> None:
 # materialize inputs for a run
 # ---------------------------------------------------------------------------
 
-def materialize_included_inputs(library: Path, state: dict, destination_root: Path) -> list[Path]:
+def materialize_included_inputs(library: Path, checked: set[str], destination_root: Path) -> list[Path]:
     destination_root.mkdir(parents=True, exist_ok=True)
 
     materialized_targets: list[Path] = []
     for folder in list_library_folders(library):
         included_files = [
-            f for f in list_scope_files(folder) if is_file_included(library, f, state)
+            f for f in list_scope_files(folder) if f"{folder.name}/{f.stem}" in checked
         ]
         if not included_files:
             continue
@@ -504,63 +490,6 @@ def common_upload_root(uploaded_files: list) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# State: include/exclude (persisted to disk)
-# ---------------------------------------------------------------------------
-
-def load_library_state(library: Path) -> dict:
-    state_path = library / LIBRARY_STATE_FILENAME
-    if not state_path.exists():
-        return {"folders": {}, "files": {}}
-
-    try:
-        data = json.loads(state_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {"folders": {}, "files": {}}
-
-    return {
-        "folders": data.get("folders", {}),
-        "files": data.get("files", {}),
-    }
-
-
-def save_library_state(library: Path, state: dict) -> None:
-    (library / LIBRARY_STATE_FILENAME).write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-
-def scope_key(scope: Path, library: Path) -> str:
-    if scope == library:
-        return LIBRARY_ROOT_KEY
-    return str(scope.relative_to(library)).replace("\\", "/")
-
-
-def file_key(path: Path, library: Path) -> str:
-    return str(path.relative_to(library)).replace("\\", "/")
-
-
-def is_scope_included(library: Path, scope: Path, state: dict) -> bool:
-    return bool(state.get("folders", {}).get(scope_key(scope, library), {}).get("included", True))
-
-
-def set_scope_included(library: Path, scope: Path, state: dict, included: bool) -> None:
-    folders = state.setdefault("folders", {})
-    files = state.setdefault("files", {})
-    folders[scope_key(scope, library)] = {"included": included}
-    for file_path in list_scope_files(scope):
-        files[file_key(file_path, library)] = {"included": included}
-
-
-def is_file_included(library: Path, path: Path, state: dict) -> bool:
-    file_state = state.get("files", {}).get(file_key(path, library), {})
-    if "included" in file_state:
-        return bool(file_state["included"])
-    return is_scope_included(library, path.parent, state)
-
-
-def set_file_included(library: Path, path: Path, state: dict, included: bool) -> None:
-    state.setdefault("files", {})[file_key(path, library)] = {"included": included}
-
-
-# ---------------------------------------------------------------------------
 # Library / directory helpers
 # ---------------------------------------------------------------------------
 
@@ -578,7 +507,6 @@ def list_scope_files(scope: Path) -> list[Path]:
         for path in scope.iterdir()
         if path.is_file()
         and not path.name.startswith(".")
-        and path.name != LIBRARY_STATE_FILENAME
         and path.suffix.lower() in LIBRARY_FILE_SUFFIXES
     )
 
