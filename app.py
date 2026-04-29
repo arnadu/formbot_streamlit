@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -9,6 +10,7 @@ from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
+from streamlit_tree_select import tree_select
 
 from llm_utility_mock import prepare_file, process
 
@@ -211,120 +213,130 @@ def render_main_page() -> None:
         st.info("Create a library in the sidebar to get started.")
         return
 
-    active_name = st.session_state.get(ACTIVE_LIBRARY_KEY, libraries[0].name)
-    library = LIBRARIES_DIR / active_name
-    if not library.exists():
-        library = libraries[0]
+    # ── Controls row ─────────────────────────────────────────────────────────
+    lib_col, qs_col, btn_col = st.columns([4, 4, 2], vertical_alignment="bottom")
 
+    with lib_col:
+        st.caption("Library")
+        selected_lib = st.selectbox(
+            "Library",
+            libraries,
+            index=_active_library_index(libraries),
+            format_func=lambda p: p.name,
+            key="main_library_select",
+            label_visibility="collapsed",
+        )
+        st.session_state[ACTIVE_LIBRARY_KEY] = selected_lib.name
+
+    library = selected_lib
     state = load_library_state(library)
     folders = list_library_folders(library)
+    nodes, checked = build_tree_nodes(library, folders, state)
 
-    st.header(library.name)
+    with qs_col:
+        st.caption("Question set")
+        if question_sets:
+            selected_qs = st.selectbox(
+                "Question set",
+                question_sets,
+                format_func=lambda p: p.name,
+                key="main_qs_select",
+                label_visibility="collapsed",
+            )
+        else:
+            st.caption("Upload a question set in the sidebar.")
+            selected_qs = None
+
+    with btn_col:
+        can_run = bool(checked) and selected_qs is not None
+        if st.button(
+            "▶  Run",
+            type="primary",
+            disabled=not can_run,
+            key="run_btn",
+            use_container_width=True,
+        ):
+            _do_run(library, selected_qs, state)
+
+    # ── File tree ─────────────────────────────────────────────────────────────
     st.divider()
 
-    tree_col, run_col = st.columns([11, 9])
+    if not folders:
+        st.info("No folders yet — create one in the sidebar and upload files.")
+    else:
+        # Key includes a content hash so the tree re-initialises (and picks up the
+        # correct checked list) whenever files are added or removed.
+        stems_sig = hashlib.md5(
+            ",".join(sorted(c["value"] for n in nodes for c in n.get("children", []))).encode()
+        ).hexdigest()[:8]
+        result = tree_select(
+            nodes,
+            checked=checked,
+            check_model="leaf",
+            expand_on_click=True,
+            show_expand_all=True,
+            key=f"file_tree_{library.name}_{stems_sig}",
+        )
+        new_checked = set(result["checked"])
+        if new_checked != set(checked):
+            sync_tree_to_state(library, folders, state, new_checked)
+            save_library_state(library, state)
 
-    with tree_col:
-        render_file_tree(library, folders, state)
-
-    with run_col:
-        render_run_panel(library, question_sets, state)
+    if selected_qs:
+        questions_xlsx = selected_qs / "questions.xlsx"
+        if questions_xlsx.exists():
+            with st.expander("Preview questions"):
+                st.dataframe(pd.read_excel(questions_xlsx), width="stretch")
 
     st.divider()
     render_results_panel()
 
 
-def render_file_tree(library: Path, folders: list[Path], state: dict) -> None:
-    st.subheader("Files")
+def build_tree_nodes(library: Path, folders: list[Path], state: dict) -> tuple[list[dict], list[str]]:
+    """Build tree_select node list and the corresponding list of checked leaf values.
 
-    if not folders:
-        st.info("No folders yet — create one in the sidebar and upload files.")
-        return
-
-    st.caption("Check or uncheck folders and files to include them in processing.")
-
+    Files are deduplicated by stem so that a PDF and its prepared .md appear
+    as a single entry. The node value is "folder_name/stem" which is stable
+    and unique within a library.
+    """
+    nodes: list[dict] = []
+    checked: list[str] = []
     for folder in folders:
-        files = list_scope_files(folder)
-        folder_included = is_scope_included(library, folder, state)
-
-        new_folder_included = st.checkbox(
-            f"📁 **{folder.name}**",
-            value=folder_included,
-            key=f"tree_folder_{library.name}_{folder.name}",
-        )
-        if new_folder_included != folder_included:
-            set_scope_included(library, folder, state, new_folder_included)
-            save_library_state(library, state)
-            st.rerun()
-
-        for file_path in files:
-            _, fcol = st.columns([1, 20])
-            with fcol:
-                icon = "📄" if file_path.suffix.lower() == ".md" else "📋"
-                cur = is_file_included(library, file_path, state)
-                new = st.checkbox(
-                    f"{icon} {file_path.name}",
-                    value=cur,
-                    key=f"tree_file_{library.name}_{file_key(file_path, library)}",
-                )
-                if new != cur:
-                    set_file_included(library, file_path, state, new)
-                    save_library_state(library, state)
+        stems = sorted({f.stem for f in list_scope_files(folder)})
+        children = []
+        for stem in stems:
+            value = f"{folder.name}/{stem}"
+            children.append({"label": stem, "value": value})
+            if any(is_file_included(library, f, state) for f in list_scope_files(folder) if f.stem == stem):
+                checked.append(value)
+        nodes.append({"label": folder.name, "value": f"_folder_{folder.name}", "children": children})
+    return nodes, checked
 
 
-def render_run_panel(
-    library: Path,
-    question_sets: list[Path],
-    state: dict,
-) -> None:
-    st.subheader("Run")
+def sync_tree_to_state(library: Path, folders: list[Path], state: dict, checked_values: set[str]) -> None:
+    """Write back the tree's checked leaf values to the persisted include/exclude state."""
+    for folder in folders:
+        for f in list_scope_files(folder):
+            set_file_included(library, f, state, f"{folder.name}/{f.stem}" in checked_values)
 
-    if not question_sets:
-        st.info("Upload a question set in the sidebar to enable running.")
-        return
 
-    selected_qs = st.selectbox(
-        "Question set",
-        question_sets,
-        format_func=lambda p: p.name,
-        key="run_panel_qs",
-    )
-
+def _do_run(library: Path, selected_qs: Path, state: dict) -> None:
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
+    run_path = RUNS_DIR / run_id
+    targets = materialize_included_inputs(library, state, run_path / "_selected_inputs")
     questions_xlsx = selected_qs / "questions.xlsx"
-    if questions_xlsx.exists():
-        with st.expander("Preview questions"):
-            st.dataframe(pd.read_excel(questions_xlsx), width="stretch")
-
-    can_run = any(
-        is_file_included(library, f, state)
-        for folder in list_library_folders(library)
-        for f in list_scope_files(folder)
-    )
-    if not can_run:
-        st.warning("No files included. Check at least one file in the tree.")
-
-    if st.button(
-        "▶  Run process()",
-        type="primary",
-        disabled=not can_run,
-        key="run_process_btn",
-        width="stretch",
-    ):
-        run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
-        run_path = RUNS_DIR / run_id
-        targets = materialize_included_inputs(library, state, run_path / "_selected_inputs")
-        jsonl_path, xlsx_path = process(targets, questions_xlsx, run_path, library.name)
-        metadata = {
-            "run_id": run_id,
-            "library": library.name,
-            "question_set": selected_qs.name,
-            "jsonl_path": str(jsonl_path),
-            "xlsx_path": str(xlsx_path),
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        (run_path / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        flash(f"Run `{run_id}` complete.")
-        st.rerun()
+    jsonl_path, xlsx_path = process(targets, questions_xlsx, run_path, library.name)
+    metadata = {
+        "run_id": run_id,
+        "library": library.name,
+        "question_set": selected_qs.name,
+        "jsonl_path": str(jsonl_path),
+        "xlsx_path": str(xlsx_path),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (run_path / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    flash(f"Run `{run_id}` complete.")
+    st.rerun()
 
 
 def render_results_panel() -> None:
