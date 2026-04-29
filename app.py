@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_tree_select import tree_select
 
-from llm_utility_mock import prepare_file, process
+from llm_utility_mock import load_questions, prepare_file, process_folder, write_results
 
 
 APP_DATA = Path("app_data")
@@ -310,8 +310,16 @@ def _do_run(library: Path, selected_qs: Path, checked: set[str]) -> None:
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
     run_path = RUNS_DIR / run_id
     targets = materialize_included_inputs(library, checked, run_path / "_selected_inputs")
-    questions_xlsx = selected_qs / "questions.xlsx"
-    jsonl_path, xlsx_path = process(targets, questions_xlsx, run_path, library.name)
+    questions = load_questions(selected_qs / "questions.xlsx")
+
+    rows: list[dict] = []
+    with st.status("Running process()…", expanded=True) as status:
+        for folder in targets:
+            st.write(f"↳ {folder.name}")
+            rows.extend(process_folder(folder, questions, library.name))
+        jsonl_path, xlsx_path = write_results(rows, run_path)
+        status.update(label=f"process() complete — {len(rows)} answer(s) written.", state="complete")
+
     metadata = {
         "run_id": run_id,
         "library": library.name,
