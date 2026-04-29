@@ -287,7 +287,7 @@ def render_main_page() -> None:
                 st.dataframe(pd.read_excel(questions_xlsx), width="stretch")
 
     st.divider()
-    render_results_panel()
+    render_results_panel(library.name, selected_qs.name if selected_qs else None)
 
 
 def build_tree_nodes(folders: list[Path]) -> tuple[list[dict], list[str]]:
@@ -333,8 +333,24 @@ def _do_run(library: Path, selected_qs: Path, checked: set[str]) -> None:
     st.rerun()
 
 
-def render_results_panel() -> None:
-    runs = list_named_dirs(RUNS_DIR)
+def _run_matches(run_path: Path, library_name: str, qs_name: str | None) -> bool:
+    metadata_path = run_path / "metadata.json"
+    if not metadata_path.exists():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    if metadata.get("library") != library_name:
+        return False
+    if qs_name and metadata.get("question_set") != qs_name:
+        return False
+    return True
+
+
+def render_results_panel(library_name: str, qs_name: str | None) -> None:
+    all_runs = list_named_dirs(RUNS_DIR)
+    runs = [r for r in all_runs if _run_matches(r, library_name, qs_name)]
     if not runs:
         return
 
