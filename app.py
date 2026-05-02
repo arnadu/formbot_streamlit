@@ -2,20 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
 import shutil
-import threading
-import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
 
 import pandas as pd
 import streamlit as st
@@ -35,15 +26,6 @@ ACTIVE_LIBRARY_KEY = "active_library"
 MAKER_SYSTEM_PROMPT = "You are a document extraction expert. Extract the requested information accurately."
 CHECKER_SYSTEM_PROMPT = "You are a quality checker. Verify that the extracted information is correct."
 LLM_PARAMS: dict = {}
-
-@st.cache_resource
-def _get_jobs() -> dict:
-    # Streamlit re-executes the script on every rerun, so a plain module-level
-    # dict is reset to {} each time. @st.cache_resource stores the object in
-    # Streamlit's own singleton cache (keyed by function name), so the same dict
-    # is returned on every rerun and is also visible to background threads that
-    # received it as an explicit argument when they were started.
-    return {}
 
 
 def main() -> None:
@@ -187,7 +169,7 @@ def render_library_management_sidebar() -> None:
         args=(dir_upload_key, library, True),
     )
 
-    _start_pending_prepare()
+    _run_pending_prepare()
 
 
 @st.fragment
@@ -232,68 +214,6 @@ def render_main_page() -> None:
     if not libraries:
         st.info("Create a library in the sidebar to get started.")
         return
-
-    # ── Prepare progress ──────────────────────────────────────────────────────
-    # Poll by sleeping and calling st.rerun() from the main script — simpler and
-    # more reliable than fragments for this use case.
-    jobs = _get_jobs()
-    active_prepare_id = st.session_state.get("active_prepare_id")
-    if active_prepare_id:
-        job = jobs.get(active_prepare_id)
-        if job:
-            with st.status("Running prepare()…", expanded=True) as status:
-                for msg in job["progress"]:
-                    st.write(msg)
-                if job["status"] == "complete":
-                    count = len(job["progress"])
-                    status.update(label=f"prepare() complete — {count} file(s) processed.", state="complete")
-                    jobs.pop(active_prepare_id, None)
-                    del st.session_state["active_prepare_id"]
-                    st.rerun()
-                elif job["status"] == "error":
-                    status.update(label=f"prepare() failed: {job['error']}", state="error")
-                    jobs.pop(active_prepare_id, None)
-                    del st.session_state["active_prepare_id"]
-                    st.rerun()
-                else:
-                    time.sleep(0.5)
-                    st.rerun()
-        else:
-            time.sleep(0.1)
-            st.rerun()
-
-    # ── Run progress ──────────────────────────────────────────────────────────
-    active_run_id = st.session_state.get("active_run_id")
-    logging.debug("render_main_page: active_run_id=%s, jobs keys=%s", active_run_id, list(jobs.keys()))
-    if active_run_id:
-        job = jobs.get(active_run_id)
-        logging.debug("render_main_page: job=%s", job)
-        if job:
-            with st.status("Running process()…", expanded=True) as status:
-                for msg in job["progress"]:
-                    st.write(msg)
-                if job["status"] == "complete":
-                    run_id = job.get("result", "")
-                    count = len(job["progress"])
-                    status.update(label=f"process() complete — {count} folder(s) processed.", state="complete")
-                    flash(f"Run `{run_id}` complete.")
-                    jobs.pop(active_run_id, None)
-                    del st.session_state["active_run_id"]
-                    st.rerun()
-                elif job["status"] == "error":
-                    status.update(label=f"process() failed: {job['error']}", state="error")
-                    flash(f"Run failed: {job['error']}")
-                    jobs.pop(active_run_id, None)
-                    del st.session_state["active_run_id"]
-                    st.rerun()
-                else:
-                    logging.debug("render_main_page: job still running (%d items), sleeping", len(job["progress"]))
-                    time.sleep(0.5)
-                    st.rerun()
-        else:
-            logging.warning("render_main_page: active_run_id set but job not in jobs registry yet")
-            time.sleep(0.1)
-            st.rerun()
 
     # ── Controls row ─────────────────────────────────────────────────────────
     lib_col, qs_col, btn_col = st.columns([4, 4, 2], vertical_alignment="bottom")
@@ -354,10 +274,7 @@ def render_main_page() -> None:
         checked = set(result["checked"])
 
     with btn_col:
-        job_running = bool(
-            st.session_state.get("active_prepare_id") or st.session_state.get("active_run_id")
-        )
-        can_run = bool(checked) and selected_qs is not None and not job_running
+        can_run = bool(checked) and selected_qs is not None
         if st.button(
             "▶  Run",
             type="primary",
@@ -397,40 +314,13 @@ def _do_run(library: Path, selected_qs: Path, checked: set[str]) -> None:
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
     run_path = RUNS_DIR / run_id
     run_path.mkdir(parents=True, exist_ok=True)
-    job_id = f"run-{run_id}"
-    jobs = _get_jobs()
-    jobs[job_id] = {"status": "running", "progress": [], "error": None, "result": None}
-    st.session_state["active_run_id"] = job_id
-    logging.info("_do_run: starting job %s (library=%s, qs=%s, checked=%d)", job_id, library.name, selected_qs.name, len(checked))
-    # Pass the registry explicitly so the thread never relies on module globals,
-    # which point to a different namespace on each script re-execution.
-    threading.Thread(
-        target=_background_run,
-        args=(job_id, library, selected_qs, checked, run_path, jobs),
-        daemon=True,
-    ).start()
-    st.rerun()
+    targets = materialize_included_inputs(library, checked, run_path / "_selected_inputs")
+    template_df = load_template(selected_qs / "questions.xlsx")
+    jsonl_path = run_path / "results.jsonl"
 
-
-def _background_run(
-    job_id: str,
-    library: Path,
-    selected_qs: Path,
-    checked: set[str],
-    run_path: Path,
-    jobs: dict,
-) -> None:
-    logging.info("_background_run: started job %s", job_id)
-    try:
-        run_id = run_path.name
-        targets = materialize_included_inputs(library, checked, run_path / "_selected_inputs")
-        template_df = load_template(selected_qs / "questions.xlsx")
-        jsonl_path = run_path / "results.jsonl"
-        logging.info("_background_run: %d target folder(s) to process", len(targets))
-
+    with st.status("Running process()…", expanded=True) as status:
         for folder in targets:
-            logging.info("_background_run: processing folder %s", folder.name)
-            jobs[job_id]["progress"].append(f"↳ {folder.name}")
+            st.write(f"↳ {folder.name}")
             process_folder(
                 MAKER_SYSTEM_PROMPT,
                 CHECKER_SYSTEM_PROMPT,
@@ -439,24 +329,20 @@ def _background_run(
                 LLM_PARAMS,
                 str(jsonl_path),
             )
-
         xlsx_path = write_results(jsonl_path)
-        metadata = {
-            "run_id": run_id,
-            "library": library.name,
-            "question_set": selected_qs.name,
-            "jsonl_path": str(jsonl_path),
-            "xlsx_path": str(xlsx_path),
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        (run_path / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        jobs[job_id]["result"] = run_id
-        jobs[job_id]["status"] = "complete"
-        logging.info("_background_run: job %s complete", job_id)
-    except Exception as exc:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(exc)
-        logging.error("_background_run: job %s failed: %s", job_id, exc)
+        status.update(label=f"process() complete — {len(targets)} folder(s) processed.", state="complete")
+
+    metadata = {
+        "run_id": run_id,
+        "library": library.name,
+        "question_set": selected_qs.name,
+        "jsonl_path": str(jsonl_path),
+        "xlsx_path": str(xlsx_path),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    (run_path / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    flash(f"Run `{run_id}` complete.")
+    st.rerun()
 
 
 def _run_matches(run_path: Path, library_name: str, qs_name: str | None) -> bool:
@@ -546,33 +432,25 @@ def _on_upload(upload_key: str, destination: Path, strip_common_root: bool) -> N
         flash(f"Uploaded {len(files)} file(s) into `{destination.name}`.")
         # on_change callbacks run before the script rerenders, so st.status/st.write
         # are not available here. We store the saved paths and defer prepare() to
-        # _start_pending_prepare(), which is called from the normal render pass.
+        # _run_pending_prepare(), which is called from the normal render pass.
         pending: set[Path] = st.session_state.get("pending_prepare", set())
         pending |= saved
         st.session_state["pending_prepare"] = pending
 
 
-def _start_pending_prepare() -> None:
+def _run_pending_prepare() -> None:
+    # Having prepare_file() operate on a single file lets us call it once per
+    # uploaded file and log each one individually inside st.status.
     pending: set[Path] | None = st.session_state.pop("pending_prepare", None)
     if not pending:
         return
-    job_id = f"prepare-{uuid4().hex[:8]}"
-    jobs = _get_jobs()
-    jobs[job_id] = {"status": "running", "progress": [], "error": None}
-    st.session_state["active_prepare_id"] = job_id
-    threading.Thread(target=_background_prepare, args=(job_id, pending, jobs), daemon=True).start()
-    st.rerun()
-
-
-def _background_prepare(job_id: str, pending: set[Path], jobs: dict) -> None:
-    try:
+    with st.status("Running prepare()…", expanded=True) as status:
+        count = 0
         for path in sorted(pending):
+            st.write(f"↳ {path.name}")
             prepare_file(path)
-            jobs[job_id]["progress"].append(f"↳ {path.name}")
-        jobs[job_id]["status"] = "complete"
-    except Exception as exc:
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"] = str(exc)
+            count += 1
+        status.update(label=f"prepare() complete — {count} file(s) processed.", state="complete")
 
 
 def save_question_set(question_file) -> str:
