@@ -5,6 +5,7 @@ import json
 import re
 import shutil
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -37,20 +38,9 @@ _jobs: dict[str, dict] = {}
 def main() -> None:
     st.set_page_config(page_title="FormBot Utility", layout="wide")
     ensure_storage()
-    _cleanup_stale_job_keys()
     render_sidebar()
     render_flash_message()
     render_main_page()
-
-
-def _cleanup_stale_job_keys() -> None:
-    # When a fragment finishes a job it pops from _jobs and calls st.rerun(scope="app").
-    # On that full page rerun, session keys pointing to gone jobs are cleared here so
-    # the Run button re-enables and the flash message is shown.
-    for ss_key in ("active_prepare_id", "active_run_id"):
-        job_id = st.session_state.get(ss_key)
-        if job_id and job_id not in _jobs:
-            del st.session_state[ss_key]
 
 
 def render_flash_message() -> None:
@@ -232,8 +222,62 @@ def render_main_page() -> None:
         st.info("Create a library in the sidebar to get started.")
         return
 
-    render_prepare_progress()
-    render_run_progress()
+    # ── Prepare progress ──────────────────────────────────────────────────────
+    # Poll by sleeping and calling st.rerun() from the main script — simpler and
+    # more reliable than fragments for this use case.
+    active_prepare_id = st.session_state.get("active_prepare_id")
+    if active_prepare_id:
+        job = _jobs.get(active_prepare_id)
+        if job:
+            with st.status("Running prepare()…", expanded=True) as status:
+                for msg in job["progress"]:
+                    st.write(msg)
+                if job["status"] == "complete":
+                    count = len(job["progress"])
+                    status.update(label=f"prepare() complete — {count} file(s) processed.", state="complete")
+                    _jobs.pop(active_prepare_id, None)
+                    del st.session_state["active_prepare_id"]
+                    st.rerun()
+                elif job["status"] == "error":
+                    status.update(label=f"prepare() failed: {job['error']}", state="error")
+                    _jobs.pop(active_prepare_id, None)
+                    del st.session_state["active_prepare_id"]
+                    st.rerun()
+                else:
+                    time.sleep(0.5)
+                    st.rerun()
+        else:
+            time.sleep(0.1)
+            st.rerun()
+
+    # ── Run progress ──────────────────────────────────────────────────────────
+    active_run_id = st.session_state.get("active_run_id")
+    if active_run_id:
+        job = _jobs.get(active_run_id)
+        if job:
+            with st.status("Running process()…", expanded=True) as status:
+                for msg in job["progress"]:
+                    st.write(msg)
+                if job["status"] == "complete":
+                    run_id = job.get("result", "")
+                    count = len(job["progress"])
+                    status.update(label=f"process() complete — {count} folder(s) processed.", state="complete")
+                    flash(f"Run `{run_id}` complete.")
+                    _jobs.pop(active_run_id, None)
+                    del st.session_state["active_run_id"]
+                    st.rerun()
+                elif job["status"] == "error":
+                    status.update(label=f"process() failed: {job['error']}", state="error")
+                    flash(f"Run failed: {job['error']}")
+                    _jobs.pop(active_run_id, None)
+                    del st.session_state["active_run_id"]
+                    st.rerun()
+                else:
+                    time.sleep(0.5)
+                    st.rerun()
+        else:
+            time.sleep(0.1)
+            st.rerun()
 
     # ── Controls row ─────────────────────────────────────────────────────────
     lib_col, qs_col, btn_col = st.columns([4, 4, 2], vertical_alignment="bottom")
@@ -317,48 +361,6 @@ def render_main_page() -> None:
     render_results_panel(library.name, selected_qs.name if selected_qs else None)
 
 
-@st.fragment(run_every=1)
-def render_prepare_progress() -> None:
-    job_id = st.session_state.get("active_prepare_id")
-    if not job_id or job_id not in _jobs:
-        return
-    job = _jobs[job_id]
-    with st.status("Running prepare()…", expanded=True) as status:
-        for msg in job["progress"]:
-            st.write(msg)
-        if job["status"] == "complete":
-            count = len(job["progress"])
-            status.update(label=f"prepare() complete — {count} file(s) processed.", state="complete")
-            _jobs.pop(job_id, None)
-            st.rerun(scope="app")
-        elif job["status"] == "error":
-            status.update(label=f"prepare() failed: {job['error']}", state="error")
-            _jobs.pop(job_id, None)
-            st.rerun(scope="app")
-
-
-@st.fragment(run_every=1)
-def render_run_progress() -> None:
-    job_id = st.session_state.get("active_run_id")
-    if not job_id or job_id not in _jobs:
-        return
-    job = _jobs[job_id]
-    with st.status("Running process()…", expanded=True) as status:
-        for msg in job["progress"]:
-            st.write(msg)
-        if job["status"] == "complete":
-            run_id = job.get("result", "")
-            count = len(job["progress"])
-            status.update(label=f"process() complete — {count} folder(s) processed.", state="complete")
-            st.session_state[FLASH_MESSAGE_KEY] = f"Run `{run_id}` complete."
-            _jobs.pop(job_id, None)
-            st.rerun(scope="app")
-        elif job["status"] == "error":
-            status.update(label=f"process() failed: {job['error']}", state="error")
-            _jobs.pop(job_id, None)
-            st.rerun(scope="app")
-
-
 def build_tree_nodes(folders: list[Path]) -> tuple[list[dict], list[str]]:
     # All stems checked by default. The node value "folder/stem" is the key used
     # to match tree selections back to files in materialize_included_inputs.
@@ -380,8 +382,8 @@ def _do_run(library: Path, selected_qs: Path, checked: set[str]) -> None:
     run_path = RUNS_DIR / run_id
     run_path.mkdir(parents=True, exist_ok=True)
     job_id = f"run-{run_id}"
-    # Pre-register before starting thread so _cleanup_stale_job_keys doesn't
-    # mistake the brand-new job for a finished one on the very next rerun.
+    # Pre-register before starting thread so the polling loop in render_main_page
+    # doesn't race against the thread initialising _jobs[job_id].
     _jobs[job_id] = {"status": "running", "progress": [], "error": None, "result": None}
     st.session_state["active_run_id"] = job_id
     threading.Thread(
