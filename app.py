@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import shutil
 import threading
@@ -9,6 +10,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 import pandas as pd
 import streamlit as st
@@ -252,8 +259,10 @@ def render_main_page() -> None:
 
     # ── Run progress ──────────────────────────────────────────────────────────
     active_run_id = st.session_state.get("active_run_id")
+    logging.debug("render_main_page: active_run_id=%s", active_run_id)
     if active_run_id:
         job = _jobs.get(active_run_id)
+        logging.debug("render_main_page: job=%s", job)
         if job:
             with st.status("Running process()…", expanded=True) as status:
                 for msg in job["progress"]:
@@ -273,9 +282,11 @@ def render_main_page() -> None:
                     del st.session_state["active_run_id"]
                     st.rerun()
                 else:
+                    logging.debug("render_main_page: job still running (%d items), sleeping", len(job["progress"]))
                     time.sleep(0.5)
                     st.rerun()
         else:
+            logging.warning("render_main_page: active_run_id set but job not in _jobs yet")
             time.sleep(0.1)
             st.rerun()
 
@@ -386,6 +397,7 @@ def _do_run(library: Path, selected_qs: Path, checked: set[str]) -> None:
     # doesn't race against the thread initialising _jobs[job_id].
     _jobs[job_id] = {"status": "running", "progress": [], "error": None, "result": None}
     st.session_state["active_run_id"] = job_id
+    logging.info("_do_run: starting job %s (library=%s, qs=%s, checked=%d)", job_id, library.name, selected_qs.name, len(checked))
     threading.Thread(
         target=_background_run,
         args=(job_id, library, selected_qs, checked, run_path),
@@ -401,13 +413,16 @@ def _background_run(
     checked: set[str],
     run_path: Path,
 ) -> None:
+    logging.info("_background_run: started job %s", job_id)
     try:
         run_id = run_path.name
         targets = materialize_included_inputs(library, checked, run_path / "_selected_inputs")
         template_df = load_template(selected_qs / "questions.xlsx")
         jsonl_path = run_path / "results.jsonl"
+        logging.info("_background_run: %d target folder(s) to process", len(targets))
 
         for folder in targets:
+            logging.info("_background_run: processing folder %s", folder.name)
             _jobs[job_id]["progress"].append(f"↳ {folder.name}")
             process_folder(
                 MAKER_SYSTEM_PROMPT,
@@ -430,9 +445,11 @@ def _background_run(
         (run_path / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         _jobs[job_id]["result"] = run_id
         _jobs[job_id]["status"] = "complete"
+        logging.info("_background_run: job %s complete", job_id)
     except Exception as exc:
         _jobs[job_id]["status"] = "error"
         _jobs[job_id]["error"] = str(exc)
+        logging.error("_background_run: job %s failed: %s", job_id, exc)
 
 
 def _run_matches(run_path: Path, library_name: str, qs_name: str | None) -> bool:
