@@ -37,9 +37,20 @@ _jobs: dict[str, dict] = {}
 def main() -> None:
     st.set_page_config(page_title="FormBot Utility", layout="wide")
     ensure_storage()
+    _cleanup_stale_job_keys()
     render_sidebar()
     render_flash_message()
     render_main_page()
+
+
+def _cleanup_stale_job_keys() -> None:
+    # When a fragment finishes a job it pops from _jobs and calls st.rerun(scope="app").
+    # On that full page rerun, session keys pointing to gone jobs are cleared here so
+    # the Run button re-enables and the flash message is shown.
+    for ss_key in ("active_prepare_id", "active_run_id"):
+        job_id = st.session_state.get(ss_key)
+        if job_id and job_id not in _jobs:
+            del st.session_state[ss_key]
 
 
 def render_flash_message() -> None:
@@ -318,13 +329,12 @@ def render_prepare_progress() -> None:
         if job["status"] == "complete":
             count = len(job["progress"])
             status.update(label=f"prepare() complete — {count} file(s) processed.", state="complete")
-            del st.session_state["active_prepare_id"]
             _jobs.pop(job_id, None)
-            st.rerun()
+            st.rerun(scope="app")
         elif job["status"] == "error":
             status.update(label=f"prepare() failed: {job['error']}", state="error")
-            del st.session_state["active_prepare_id"]
             _jobs.pop(job_id, None)
+            st.rerun(scope="app")
 
 
 @st.fragment(run_every=1)
@@ -341,13 +351,12 @@ def render_run_progress() -> None:
             count = len(job["progress"])
             status.update(label=f"process() complete — {count} folder(s) processed.", state="complete")
             st.session_state[FLASH_MESSAGE_KEY] = f"Run `{run_id}` complete."
-            del st.session_state["active_run_id"]
             _jobs.pop(job_id, None)
-            st.rerun()
+            st.rerun(scope="app")
         elif job["status"] == "error":
             status.update(label=f"process() failed: {job['error']}", state="error")
-            del st.session_state["active_run_id"]
             _jobs.pop(job_id, None)
+            st.rerun(scope="app")
 
 
 def build_tree_nodes(folders: list[Path]) -> tuple[list[dict], list[str]]:

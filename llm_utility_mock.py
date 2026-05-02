@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import string
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -20,6 +21,7 @@ def prepare_file(pdf_path: str | Path) -> Path | None:
         "This is mocked Markdown content that stands in for OCR output.\n",
         encoding="utf-8",
     )
+    time.sleep(2)
     return md_file
 
 
@@ -70,6 +72,7 @@ def process_folder(
     md_files = sorted(arrangement.glob("*.md"))
     source_names = ", ".join(f.name for f in md_files) or "no md files"
 
+    time.sleep(3)
     with open(output_path, "a", encoding="utf-8") as fh:
         for _, row in template_df.iterrows():
             result = {
