@@ -380,6 +380,9 @@ def _do_run(library: Path, selected_qs: Path, checked: set[str]) -> None:
     run_path = RUNS_DIR / run_id
     run_path.mkdir(parents=True, exist_ok=True)
     job_id = f"run-{run_id}"
+    # Pre-register before starting thread so _cleanup_stale_job_keys doesn't
+    # mistake the brand-new job for a finished one on the very next rerun.
+    _jobs[job_id] = {"status": "running", "progress": [], "error": None, "result": None}
     st.session_state["active_run_id"] = job_id
     threading.Thread(
         target=_background_run,
@@ -396,7 +399,6 @@ def _background_run(
     checked: set[str],
     run_path: Path,
 ) -> None:
-    _jobs[job_id] = {"status": "running", "progress": [], "error": None, "result": None}
     try:
         run_id = run_path.name
         targets = materialize_included_inputs(library, checked, run_path / "_selected_inputs")
@@ -529,13 +531,13 @@ def _start_pending_prepare() -> None:
     if not pending:
         return
     job_id = f"prepare-{uuid4().hex[:8]}"
+    _jobs[job_id] = {"status": "running", "progress": [], "error": None}
     st.session_state["active_prepare_id"] = job_id
     threading.Thread(target=_background_prepare, args=(job_id, pending), daemon=True).start()
     st.rerun()
 
 
 def _background_prepare(job_id: str, pending: set[Path]) -> None:
-    _jobs[job_id] = {"status": "running", "progress": [], "error": None}
     try:
         for path in sorted(pending):
             prepare_file(path)
