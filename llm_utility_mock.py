@@ -52,75 +52,50 @@ def prepare(folder_names: Iterable[str | Path]) -> list[Path]:
 
 
 def process_folder(
-    folder: str | Path,
-    questions: list[dict[str, str]],
-    arrangement: str = "default",
-) -> list[dict[str, str]]:
-    """Mock LLM step for one folder: return answer rows for all questions."""
-    folder = Path(folder)
-    md_files = sorted(folder.glob("*.md"))
-    source_names = ", ".join(md_file.name for md_file in md_files) or "no md files"
-    return [
-        {
-            "arrangement": arrangement,
-            "folder": folder.name,
-            "id": q["id"],
-            "question": q["question"],
-            "answer": _random_answer(source_names),
-        }
-        for q in questions
-    ]
+    maker_system_prompt: str,
+    checker_system_prompt: str,
+    template_df: pd.DataFrame,
+    arrangement: Path,
+    llm_params: dict,
+    output_path: str,
+) -> None:
+    """Mock LLM step for one folder: append answer rows to the JSONL output file.
 
+    In the real implementation maker_system_prompt, checker_system_prompt and
+    llm_params drive the LLM calls; template_df provides the question rows;
+    arrangement is the folder of prepared .md files; output_path is the run's
+    JSONL file, opened in append mode so concurrent/sequential calls accumulate.
+    """
+    arrangement = Path(arrangement)
+    md_files = sorted(arrangement.glob("*.md"))
+    source_names = ", ".join(f.name for f in md_files) or "no md files"
 
-def write_results(rows: list[dict], output_path: str | Path) -> tuple[Path, Path]:
-    """Write accumulated answer rows to JSONL and XLSX files."""
-    output_path = Path(output_path)
-    output_path.mkdir(parents=True, exist_ok=True)
-    jsonl_path = output_path / "results.jsonl"
-    xlsx_path = output_path / "results.xlsx"
-    jsonl_path.write_text(
-        "\n".join(json.dumps(r) for r in rows) + ("\n" if rows else ""),
-        encoding="utf-8",
-    )
-    pd.DataFrame(rows).to_excel(xlsx_path, index=False)
-    return jsonl_path, xlsx_path
-
-
-def process(
-    folder_names: Iterable[str | Path],
-    questions_xlsx_path: str | Path,
-    output_dir: str | Path,
-    arrangement: str = "default",
-) -> tuple[Path, Path]:
-    """Mock LLM step: delegates to process_folder + write_results."""
-    questions = load_questions(questions_xlsx_path)
-    rows: list[dict[str, str]] = []
-    for folder_name in folder_names:
-        rows.extend(process_folder(folder_name, questions, arrangement))
-    return write_results(rows, output_dir)
-
-
-def load_questions(questions_xlsx_path: str | Path) -> list[dict[str, str]]:
-    dataframe = pd.read_excel(questions_xlsx_path)
-    dataframe.columns = [str(column).strip().lower() for column in dataframe.columns]
-
-    if "id" not in dataframe.columns:
-        dataframe.insert(0, "id", [f"q{i + 1}" for i in range(len(dataframe))])
-
-    question_column = "question" if "question" in dataframe.columns else dataframe.columns[-1]
-
-    questions: list[dict[str, str]] = []
-    for _, row in dataframe.iterrows():
-        if pd.isna(row[question_column]):
-            continue
-        questions.append(
-            {
-                "id": str(row["id"]),
-                "question": str(row[question_column]),
+    with open(output_path, "a", encoding="utf-8") as fh:
+        for _, row in template_df.iterrows():
+            result = {
+                "arrangement": arrangement.name,
+                "question": str(row.iloc[-1]),
+                "answer": _random_answer(source_names),
             }
-        )
+            fh.write(json.dumps(result) + "\n")
 
-    return questions
+
+def write_results(jsonl_path: str | Path) -> Path:
+    """Convert the JSONL results file to XLSX in the same directory."""
+    jsonl_path = Path(jsonl_path)
+    xlsx_path = jsonl_path.with_name("results.xlsx")
+    rows = [
+        json.loads(line)
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    pd.DataFrame(rows).to_excel(xlsx_path, index=False)
+    return xlsx_path
+
+
+def load_template(questions_xlsx_path: str | Path) -> pd.DataFrame:
+    """Load the questions template from an xlsx file."""
+    return pd.read_excel(questions_xlsx_path)
 
 
 def _random_answer(source_names: str) -> str:

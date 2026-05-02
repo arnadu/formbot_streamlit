@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -12,7 +13,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_tree_select import tree_select
 
-from llm_utility_mock import load_questions, prepare_file, process_folder, write_results
+from llm_utility_mock import load_template, prepare_file, process_folder, write_results
 
 
 APP_DATA = Path("app_data")
@@ -22,6 +23,15 @@ RUNS_DIR = APP_DATA / "runs"
 FLASH_MESSAGE_KEY = "_flash_message"
 LIBRARY_FILE_SUFFIXES = {".pdf", ".md"}
 ACTIVE_LIBRARY_KEY = "active_library"
+
+MAKER_SYSTEM_PROMPT = "You are a document extraction expert. Extract the requested information accurately."
+CHECKER_SYSTEM_PROMPT = "You are a quality checker. Verify that the extracted information is correct."
+LLM_PARAMS: dict = {}
+
+# Module-level job registry. Keys are job_ids; values hold status, per-item log,
+# and final result. Accessed from both the main thread and background threads;
+# list.append is GIL-atomic in CPython so no explicit lock is needed.
+_jobs: dict[str, dict] = {}
 
 
 def main() -> None:
@@ -165,7 +175,7 @@ def render_library_management_sidebar() -> None:
         args=(dir_upload_key, library, True),
     )
 
-    _run_pending_prepare()
+    _start_pending_prepare()
 
 
 @st.fragment
@@ -210,6 +220,9 @@ def render_main_page() -> None:
     if not libraries:
         st.info("Create a library in the sidebar to get started.")
         return
+
+    render_prepare_progress()
+    render_run_progress()
 
     # ── Controls row ─────────────────────────────────────────────────────────
     lib_col, qs_col, btn_col = st.columns([4, 4, 2], vertical_alignment="bottom")
@@ -270,7 +283,10 @@ def render_main_page() -> None:
         checked = set(result["checked"])
 
     with btn_col:
-        can_run = bool(checked) and selected_qs is not None
+        job_running = bool(
+            st.session_state.get("active_prepare_id") or st.session_state.get("active_run_id")
+        )
+        can_run = bool(checked) and selected_qs is not None and not job_running
         if st.button(
             "▶  Run",
             type="primary",
@@ -288,6 +304,50 @@ def render_main_page() -> None:
 
     st.divider()
     render_results_panel(library.name, selected_qs.name if selected_qs else None)
+
+
+@st.fragment(run_every=1)
+def render_prepare_progress() -> None:
+    job_id = st.session_state.get("active_prepare_id")
+    if not job_id or job_id not in _jobs:
+        return
+    job = _jobs[job_id]
+    with st.status("Running prepare()…", expanded=True) as status:
+        for msg in job["progress"]:
+            st.write(msg)
+        if job["status"] == "complete":
+            count = len(job["progress"])
+            status.update(label=f"prepare() complete — {count} file(s) processed.", state="complete")
+            del st.session_state["active_prepare_id"]
+            _jobs.pop(job_id, None)
+            st.rerun()
+        elif job["status"] == "error":
+            status.update(label=f"prepare() failed: {job['error']}", state="error")
+            del st.session_state["active_prepare_id"]
+            _jobs.pop(job_id, None)
+
+
+@st.fragment(run_every=1)
+def render_run_progress() -> None:
+    job_id = st.session_state.get("active_run_id")
+    if not job_id or job_id not in _jobs:
+        return
+    job = _jobs[job_id]
+    with st.status("Running process()…", expanded=True) as status:
+        for msg in job["progress"]:
+            st.write(msg)
+        if job["status"] == "complete":
+            run_id = job.get("result", "")
+            count = len(job["progress"])
+            status.update(label=f"process() complete — {count} folder(s) processed.", state="complete")
+            st.session_state[FLASH_MESSAGE_KEY] = f"Run `{run_id}` complete."
+            del st.session_state["active_run_id"]
+            _jobs.pop(job_id, None)
+            st.rerun()
+        elif job["status"] == "error":
+            status.update(label=f"process() failed: {job['error']}", state="error")
+            del st.session_state["active_run_id"]
+            _jobs.pop(job_id, None)
 
 
 def build_tree_nodes(folders: list[Path]) -> tuple[list[dict], list[str]]:
@@ -309,28 +369,57 @@ def build_tree_nodes(folders: list[Path]) -> tuple[list[dict], list[str]]:
 def _do_run(library: Path, selected_qs: Path, checked: set[str]) -> None:
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:8]
     run_path = RUNS_DIR / run_id
-    targets = materialize_included_inputs(library, checked, run_path / "_selected_inputs")
-    questions = load_questions(selected_qs / "questions.xlsx")
-
-    rows: list[dict] = []
-    with st.status("Running process()…", expanded=True) as status:
-        for folder in targets:
-            st.write(f"↳ {folder.name}")
-            rows.extend(process_folder(folder, questions, library.name))
-        jsonl_path, xlsx_path = write_results(rows, run_path)
-        status.update(label=f"process() complete — {len(rows)} answer(s) written.", state="complete")
-
-    metadata = {
-        "run_id": run_id,
-        "library": library.name,
-        "question_set": selected_qs.name,
-        "jsonl_path": str(jsonl_path),
-        "xlsx_path": str(xlsx_path),
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    (run_path / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    flash(f"Run `{run_id}` complete.")
+    run_path.mkdir(parents=True, exist_ok=True)
+    job_id = f"run-{run_id}"
+    st.session_state["active_run_id"] = job_id
+    threading.Thread(
+        target=_background_run,
+        args=(job_id, library, selected_qs, checked, run_path),
+        daemon=True,
+    ).start()
     st.rerun()
+
+
+def _background_run(
+    job_id: str,
+    library: Path,
+    selected_qs: Path,
+    checked: set[str],
+    run_path: Path,
+) -> None:
+    _jobs[job_id] = {"status": "running", "progress": [], "error": None, "result": None}
+    try:
+        run_id = run_path.name
+        targets = materialize_included_inputs(library, checked, run_path / "_selected_inputs")
+        template_df = load_template(selected_qs / "questions.xlsx")
+        jsonl_path = run_path / "results.jsonl"
+
+        for folder in targets:
+            _jobs[job_id]["progress"].append(f"↳ {folder.name}")
+            process_folder(
+                MAKER_SYSTEM_PROMPT,
+                CHECKER_SYSTEM_PROMPT,
+                template_df,
+                folder,
+                LLM_PARAMS,
+                str(jsonl_path),
+            )
+
+        xlsx_path = write_results(jsonl_path)
+        metadata = {
+            "run_id": run_id,
+            "library": library.name,
+            "question_set": selected_qs.name,
+            "jsonl_path": str(jsonl_path),
+            "xlsx_path": str(xlsx_path),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        (run_path / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        _jobs[job_id]["result"] = run_id
+        _jobs[job_id]["status"] = "complete"
+    except Exception as exc:
+        _jobs[job_id]["status"] = "error"
+        _jobs[job_id]["error"] = str(exc)
 
 
 def _run_matches(run_path: Path, library_name: str, qs_name: str | None) -> bool:
@@ -420,25 +509,32 @@ def _on_upload(upload_key: str, destination: Path, strip_common_root: bool) -> N
         flash(f"Uploaded {len(files)} file(s) into `{destination.name}`.")
         # on_change callbacks run before the script rerenders, so st.status/st.write
         # are not available here. We store the saved paths and defer prepare() to
-        # _run_pending_prepare(), which is called from the normal render pass.
+        # _start_pending_prepare(), which is called from the normal render pass.
         pending: set[Path] = st.session_state.get("pending_prepare", set())
         pending |= saved
         st.session_state["pending_prepare"] = pending
 
 
-def _run_pending_prepare() -> None:
-    # Having prepare_file() operate on a single file lets us call it once per
-    # uploaded file and log each one individually — no callback injection needed.
+def _start_pending_prepare() -> None:
     pending: set[Path] | None = st.session_state.pop("pending_prepare", None)
     if not pending:
         return
-    with st.status("Running prepare()…", expanded=True) as status:
-        count = 0
+    job_id = f"prepare-{uuid4().hex[:8]}"
+    st.session_state["active_prepare_id"] = job_id
+    threading.Thread(target=_background_prepare, args=(job_id, pending), daemon=True).start()
+    st.rerun()
+
+
+def _background_prepare(job_id: str, pending: set[Path]) -> None:
+    _jobs[job_id] = {"status": "running", "progress": [], "error": None}
+    try:
         for path in sorted(pending):
-            st.write(f"↳ {path.name}")
             prepare_file(path)
-            count += 1
-        status.update(label=f"prepare() complete — {count} file(s) created.", state="complete")
+            _jobs[job_id]["progress"].append(f"↳ {path.name}")
+        _jobs[job_id]["status"] = "complete"
+    except Exception as exc:
+        _jobs[job_id]["status"] = "error"
+        _jobs[job_id]["error"] = str(exc)
 
 
 def save_question_set(question_file) -> str:
